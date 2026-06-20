@@ -1,0 +1,16 @@
+# WhatsApp session & cache (contains auth tokens)
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Downloaded media
+media/
+Serbare/
+Premiere/
+*/images/
+*/videos/
+
+# Logs
+*.log
+
+# Node
+node_modules/

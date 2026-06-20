@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-media-scraper",
+  "version": "1.0.0",
+  "description": "Download images and videos from a WhatsApp group",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "menu": "node menu.js"
+  },
+  "dependencies": {
+    "inquirer": "^8.2.7",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.26.0"
+  }
+}
