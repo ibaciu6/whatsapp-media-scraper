@@ -2,12 +2,14 @@
 .wwebjs_auth/
 .wwebjs_cache/
 
-# Downloaded media
+# Downloaded/exported chat output (any output folder name)
 media/
-Serbare/
-Premiere/
+*/conversation.txt
 */images/
 */videos/
+*/audio/
+*/documents/
+*/stickers/
 
 # Logs
 *.log
