@@ -1,4 +1,5 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
+const ChatFactory = require('whatsapp-web.js/src/factories/ChatFactory');
 const qrcode = require('qrcode-terminal');
 const inquirer = require('inquirer');
 const fs = require('fs');
@@ -18,6 +19,30 @@ function extFromMime(m) {
   return MIME_TO_EXT[b] || '.' + b.split('/')[1];
 }
 function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
+
+async function getChatsCompat(client) {
+  const models = await client.pupPage.evaluate(async () => {
+    const messages = window.require('WAWebCollections').Msg;
+    const originalGetMessagesById = messages.getMessagesById;
+
+    // WhatsApp Web may expose lastReceivedKey without the legacy _serialized
+    // field. whatsapp-web.js 1.34.7 otherwise sends [undefined] to IndexedDB.
+    messages.getMessagesById = function(ids, ...args) {
+      if (!Array.isArray(ids) || ids.some(id => !id)) {
+        return Promise.resolve({ messages: [] });
+      }
+      return originalGetMessagesById.call(this, ids, ...args);
+    };
+
+    try {
+      return await window.WWebJS.getChats();
+    } finally {
+      messages.getMessagesById = originalGetMessagesById;
+    }
+  });
+
+  return models.map(model => ChatFactory.create(client, model));
+}
 
 function todayLocal() {
   const d = new Date();
@@ -112,7 +137,7 @@ async function main() {
 
   console.log('✓ Connected\n');
 
-  const chats = await client.getChats();
+  const chats = await getChatsCompat(client);
   const groups = chats.filter(c => c.isGroup);
 
   while (true) {
