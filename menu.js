@@ -1,12 +1,11 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const ChatFactory = require('whatsapp-web.js/src/factories/ChatFactory');
 const qrcode = require('qrcode-terminal');
 const inquirer = require('inquirer');
 const fs = require('fs');
 const path = require('path');
-const { importExport } = require('./import-export');
+const PKG = require('./package.json');
 
 const BASE_OUT = process.env.OUTPUT_DIR || __dirname;
+let ChatFactory = null;
 
 const MIME_TO_EXT = {
   'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/png': '.png',
@@ -43,6 +42,7 @@ async function senderLabel(msg, chat) {
 }
 
 async function getChatsCompat(client) {
+  if (!ChatFactory) ChatFactory = require('whatsapp-web.js/src/factories/ChatFactory');
   const models = await client.pupPage.evaluate(async () => {
     const messages = window.require('WAWebCollections').Msg;
     const originalGetMessagesById = messages.getMessagesById;
@@ -131,6 +131,15 @@ async function exportChat(chat, startTs, endTs, outDir) {
     if (endTs   && m.timestamp > endTs)   return false;
     return true;
   });
+  for (const msg of inRange) {
+    // WhatsApp Web (July 2026+) renamed the serialized message id from
+    // `_serialized` to `$1`; whatsapp-web.js 1.34.7 still reads the old name
+    // and passes `undefined` into the page, making downloadMedia() fail with
+    // a cryptic `r: r` error. Backfill so the library sees the id it expects.
+    if (msg.id && msg.id._serialized == null && msg.id.$1 != null) {
+      msg.id._serialized = msg.id.$1;
+    }
+  }
 
   if (!inRange.length) { console.log('\n  No messages found for this range.'); return { saved: 0, total: 0 }; }
   console.log(`\n  Found ${inRange.length} message(s). Exporting...\n`);
@@ -168,11 +177,8 @@ async function exportChat(chat, startTs, endTs, outDir) {
         const caption = msg.body ? ` - "${msg.body}"` : '';
         transcriptLines.push(`[${ts}] ${who}: [${subdir}/${filename}]${caption}`);
       } catch (e) {
-        // WhatsApp's media CDN expires attachments after a retention window
-        // (weeks, not years) — old media can fail with cryptic internal
-        // errors like this once it's gone from their servers.
-        console.log(`  [${i+1}/${inRange.length}] error (media likely expired on WhatsApp's servers): ${e.message}`);
-        transcriptLines.push(`[${ts}] ${who}: [${msg.type} attachment - unavailable, likely expired: ${e.message}]`);
+        console.log(`  [${i+1}/${inRange.length}] error: ${e.message}`);
+        transcriptLines.push(`[${ts}] ${who}: [${msg.type} attachment - download failed: ${e.message}]`);
       }
     } else if (msg.hasMedia) {
       transcriptLines.push(`[${ts}] ${who}: [unsupported attachment type: ${msg.type}]`);
@@ -189,65 +195,19 @@ async function exportChat(chat, startTs, endTs, outDir) {
 
 function printBanner() {
   console.clear();
-  console.log('╔══════════════════════════════════════╗');
-  console.log('║   WhatsApp Media Scraper             ║');
-  console.log('╚══════════════════════════════════════╝\n');
-}
-
-// ── Native export import (no WhatsApp Web connection needed) ───────────
-async function importFlow() {
-  while (true) {
-    const { txtPath } = await inquirer.prompt([{
-      type: 'input',
-      name: 'txtPath',
-      message: 'Path to exported chat .txt (from WhatsApp → Export chat → Include media):',
-      validate: v => v.trim().length > 0 || 'Enter a file path',
-    }]);
-
-    const resolved = path.resolve(txtPath.trim().replace(/^"(.*)"$/, '$1'));
-    if (!fs.existsSync(resolved)) {
-      console.log(`\n  ✗ File not found: ${resolved}\n`);
-      const { retry } = await inquirer.prompt([{ type: 'confirm', name: 'retry', message: 'Try another path?', default: true }]);
-      if (!retry) return;
-      continue;
-    }
-
-    const { dateFormat } = await inquirer.prompt([{
-      type: 'list', name: 'dateFormat', message: 'Date format used by the exporting phone:',
-      choices: [
-        { name: 'DD/MM/YYYY (most locales)', value: 'DMY' },
-        { name: 'MM/DD/YYYY (US)', value: 'MDY' },
-      ],
-    }]);
-
-    const defaultFolder = path.basename(resolved, '.txt').replace(/[^a-zA-Z0-9]/g, '_').slice(0, 40);
-    const { folder } = await inquirer.prompt([{
-      type: 'input', name: 'folder', message: 'Output folder name:',
-      default: defaultFolder,
-      validate: v => v.trim().length > 0 || 'Enter a folder name',
-    }]);
-
-    const outDir = path.join(BASE_OUT, folder.trim());
-    console.log('\n  ┌─────────────────────────────────────┐');
-    console.log(`  │ Source:  ${path.basename(resolved).slice(0,28).padEnd(28)}│`);
-    console.log(`  │ Output:  ${folder.trim().padEnd(28)}│`);
-    console.log('  └─────────────────────────────────────┘\n');
-
-    const { ok } = await inquirer.prompt([{ type: 'confirm', name: 'ok', message: 'Start import?', default: true }]);
-    if (ok) {
-      const { total, saved, missing } = importExport(resolved, outDir, dateFormat);
-      console.log(`\n  ✓ Done — ${saved} file(s) saved (${missing} missing) + conversation.txt (${total} messages) saved to:\n    ${outDir}\n`);
-    }
-
-    const { again } = await inquirer.prompt([{ type: 'confirm', name: 'again', message: 'Import another export?', default: false }]);
-    if (!again) return;
-    printBanner();
-  }
+  const title = `WhatsApp Media Scraper v${PKG.version}`;
+  const W = 38;
+  console.log('╔' + '═'.repeat(W) + '╗');
+  console.log('║' + title.padStart(Math.floor((W + title.length) / 2)).padEnd(W) + '║');
+  console.log('╚' + '═'.repeat(W) + '╝\n');
 }
 
 // ── Live scrape over WhatsApp Web ───────────────────────────────────────
 async function liveScrapeFlow() {
-  console.log('Connecting to WhatsApp...\n');
+  console.log('\n── Connecting to WhatsApp Web ──\n');
+  console.log('  • Loading WhatsApp library...');
+  const { Client, LocalAuth } = require('whatsapp-web.js');
+  console.log('  • Launching browser (Chromium)...');
 
   const client = new Client({
     authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.wwebjs_auth') }),
@@ -255,21 +215,30 @@ async function liveScrapeFlow() {
   });
 
   await new Promise((resolve, reject) => {
+    let authed = false;
     client.on('qr', qr => {
-      console.log('\nScan this QR with WhatsApp → Linked Devices:\n');
+      console.log('\n  • Scan this QR with WhatsApp → Linked Devices → Link a device:\n');
       qrcode.generate(qr, { small: true });
+      console.log('\n  Waiting for scan...');
     });
-    client.on('authenticated', () => console.log('✓ Authenticated'));
+    // The 'authenticated' event can fire more than once during session
+    // restore — only report the first one.
+    client.on('authenticated', () => {
+      if (authed) return;
+      authed = true;
+      console.log('  • Authenticated — resolving session...');
+    });
     client.on('auth_failure', e => reject(new Error('Auth failed: ' + e)));
     client.on('ready', resolve);
-    client.initialize();
+    client.initialize().catch(reject);
   });
 
-  console.log('✓ Connected\n');
-
+  console.log('  • Connected — loading chat list...');
   const chats = await getChatsCompat(client);
   const groups = chats.filter(c => c.isGroup);
   const personalChats = chats.filter(c => !c.isGroup && c.id._serialized !== 'status@broadcast');
+
+  console.log(`  ✓ Ready — ${chats.length} chats found (${groups.length} groups, ${personalChats.length} personal).\n`);
 
   while (true) {
     // ── Chat type ─────────────────────────────────────────
@@ -281,7 +250,7 @@ async function liveScrapeFlow() {
         { name: 'Group', value: 'group' },
         { name: 'Personal chat', value: 'personal' },
         new inquirer.Separator(),
-        { name: '⛔  Back to main menu', value: 'exit' },
+        { name: '⛔  Exit', value: 'exit' },
       ],
     }]);
 
@@ -388,32 +357,12 @@ async function liveScrapeFlow() {
   await client.destroy();
 }
 
-// ── Main menu ────────────────────────────────────────────────────────
+// ── Entry point ────────────────────────────────────────────────────────
 async function main() {
   printBanner();
-
-  while (true) {
-    const { mode } = await inquirer.prompt([{
-      type: 'list',
-      name: 'mode',
-      message: 'What would you like to do?',
-      choices: [
-        { name: 'Scrape a live chat (WhatsApp Web — recent history + media)', value: 'live' },
-        { name: 'Import a native chat export (Export chat → Include media — full history)', value: 'import' },
-        new inquirer.Separator(),
-        { name: '⛔  Exit', value: 'exit' },
-      ],
-    }]);
-
-    if (mode === 'exit') break;
-    if (mode === 'live') await liveScrapeFlow();
-    if (mode === 'import') await importFlow();
-
-    printBanner();
-  }
-
+  await liveScrapeFlow();
   console.log('\nGoodbye!\n');
   process.exit(0);
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+if (require.main === module) main().catch(e => { console.error(e); process.exit(1); });

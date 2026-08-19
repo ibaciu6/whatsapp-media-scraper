@@ -154,6 +154,15 @@ async function exportChat(chat, startTs, endTs, outDir) {
     if (endTs   && m.timestamp > endTs)   return false;
     return true;
   });
+  for (const msg of inRange) {
+    // WhatsApp Web (July 2026+) renamed the serialized message id from
+    // `_serialized` to `$1`; whatsapp-web.js 1.34.7 still reads the old name
+    // and passes `undefined` into the page, making downloadMedia() fail with
+    // a cryptic `r: r` error. Backfill so the library sees the id it expects.
+    if (msg.id && msg.id._serialized == null && msg.id.$1 != null) {
+      msg.id._serialized = msg.id.$1;
+    }
+  }
 
   if (!inRange.length) { console.log('[INFO] No messages found for this range.'); return { saved: 0, total: 0 }; }
   console.log(`[INFO] ${inRange.length} message(s) in range.\n`);
@@ -191,11 +200,8 @@ async function exportChat(chat, startTs, endTs, outDir) {
         const caption = msg.body ? ` - "${msg.body}"` : '';
         transcriptLines.push(`[${ts}] ${who}: [${subdir}/${filename}]${caption}`);
       } catch (err) {
-        // WhatsApp's media CDN expires attachments after a retention window
-        // (weeks, not years) — old media can fail with cryptic internal
-        // errors like this once it's gone from their servers.
-        console.log(`  [${i + 1}/${inRange.length}] error (media likely expired on WhatsApp's servers): ${err.message}`);
-        transcriptLines.push(`[${ts}] ${who}: [${msg.type} attachment - unavailable, likely expired: ${err.message}]`);
+        console.log(`  [${i + 1}/${inRange.length}] error: ${err.message}`);
+        transcriptLines.push(`[${ts}] ${who}: [${msg.type} attachment - download failed: ${err.message}]`);
       }
     } else if (msg.hasMedia) {
       transcriptLines.push(`[${ts}] ${who}: [unsupported attachment type: ${msg.type}]`);
@@ -210,6 +216,8 @@ async function exportChat(chat, startTs, endTs, outDir) {
   return { saved, total: inRange.length };
 }
 
+console.log('[INFO] Launching browser (Chromium)... this can take a while');
+
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.wwebjs_auth') }),
   puppeteer: {
@@ -218,13 +226,20 @@ const client = new Client({
   },
 });
 
+let authed = false;
+// The 'authenticated' event can fire more than once during session
+// restore — only report the first one.
+client.on('authenticated', () => {
+  if (authed) return;
+  authed = true;
+  console.log('[OK] Authenticated — resolving session, syncing chats...');
+});
 client.on('qr', qr => {
   console.log('\n[QR] Scan with WhatsApp → Linked Devices → Link a Device:\n');
   qrcode.generate(qr, { small: true });
   console.log('\nWaiting for scan...');
 });
 
-client.on('authenticated', () => console.log('[OK] Authenticated.'));
 client.on('auth_failure', msg => { console.error('[ERR] Auth failed:', msg); process.exit(1); });
 
 client.on('ready', async () => {
