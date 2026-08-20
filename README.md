@@ -34,9 +34,9 @@ The session is saved to `.wwebjs_auth/` — subsequent runs reconnect automatica
 node menu.js
 ```
 
-Opens on a main menu with two modes:
+Opens straight into the live scrape flow (banner + step-by-step status lines
+while the browser launches and the session connects):
 
-**Scrape a live chat** (connects to WhatsApp Web)
 1. **Group or personal chat** — pick which kind of chat to browse
 2. **Chat selection** — lists matching chats
 3. **Timeframe** — today, yesterday, a specific date, a date range, or all time
@@ -44,8 +44,6 @@ Opens on a main menu with two modes:
 5. **Confirmation** — shows a summary before starting
 
 The client stays connected so you can scrape multiple chats or dates without re-authenticating.
-
-**Import a native chat export** (no WhatsApp Web connection needed — see below)
 
 ### CLI
 
@@ -66,7 +64,8 @@ Name matching is case-insensitive and partial, and matches groups or personal ch
 this linked device, and media is only downloadable while it still lives on
 WhatsApp's CDN (a retention window of weeks, not years). For complete history —
 including media WhatsApp's servers have long since expired — export the chat
-from your phone instead:
+from your phone instead (the import entry point was removed from `menu.js`;
+use the standalone script below):
 
 1. Open the chat on your phone → ⋮ (or contact/group name) → **Export chat** → **Include media**
 2. Transfer the resulting `.zip` to this machine and unzip it
@@ -81,8 +80,6 @@ the `.txt`, as WhatsApp lays them out), parses the Android/iOS transcript
 format, and reorganizes it into the same output layout as the other entry
 points. `--date-format` defaults to `DMY` (most locales); pass `MDY` if the
 export came from a US-locale phone.
-
-You can also run this from `node menu.js` → **Import a native chat export**.
 
 ---
 
@@ -134,3 +131,4 @@ complete history (see above).
 - WhatsApp caps history loading at ~50 000 messages per fetch cycle
 - Media on WhatsApp's CDN expires after a retention window (weeks, not years) — expired attachments will fail to download via live scraping; use a native export to recover them
 - Running on WSL requires the `--no-sandbox` Puppeteer flag (already set)
+- A WhatsApp Web frontend update (July 2026) renamed the internal message id field `_serialized` → `$1`, which broke media downloads in whatsapp-web.js 1.34.x with an opaque `r: r` error. The scraper backfills `_serialized` from `$1` on every loaded message, so downloads keep working against both old and new builds.
