@@ -8,7 +8,7 @@
     "menu": "node menu.js"
   },
   "dependencies": {
-    "inquirer": "^8.2.7",
+    "inquirer": "^14.0.2",
     "qrcode-terminal": "^0.12.0",
     "whatsapp-web.js": "^1.26.0"
   }
