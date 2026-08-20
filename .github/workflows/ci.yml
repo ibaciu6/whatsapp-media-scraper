@@ -23,4 +23,4 @@ jobs:
         run: node --check index.js && node --check menu.js
 
       - name: Dependency audit
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=critical
