@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-media-scraper",
-  "version": "1.0.0",
-  "description": "Download images and videos from a WhatsApp group",
+  "version": "1.1.0",
+  "description": "Export WhatsApp chat transcripts and media from groups and personal chats",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -10,6 +10,6 @@
   "dependencies": {
     "inquirer": "^8.2.7",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.26.0"
+    "whatsapp-web.js": "~1.34.7"
   }
 }

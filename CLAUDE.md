@@ -42,17 +42,17 @@ Three entry points:
 
 **`index.js`** — headless CLI scraper. Accepts args, connects, downloads, exits.
 
-**`menu.js`** — interactive wrapper using `inquirer` v8 (CommonJS). Opens on a main menu with two modes:
-- **Scrape a live chat** — connects to WhatsApp Web, prompts for chat type (group vs. personal), then chat/timeframe/output folder, and keeps the client alive across multiple scrape sessions within that mode so the user doesn't need to re-authenticate.
-- **Import a native chat export** — no WhatsApp Web connection at all; prompts for the exported `.txt` path, date format, and output folder, then delegates to `import-export.js`.
+**`menu.js`** — interactive wrapper using `inquirer` v8 (CommonJS). Boots straight into the live scrape flow (no main menu): banner, step-by-step status lines while the WhatsApp library and browser load, then prompts for chat type (group vs. personal), chat/timeframe/output folder. Keeps the client alive across multiple scrape sessions so the user doesn't need to re-authenticate. `whatsapp-web.js` is lazy-loaded inside the flow so the banner renders instantly.
 
-**`import-export.js`** — parses a native WhatsApp chat export (see below) into the same output layout. Exports `importExport(txtPath, outDir, dateFormat)` for reuse from `menu.js`, and also runs standalone via CLI.
+**`import-export.js`** — parses a native WhatsApp chat export (see below) into the same output layout. Exports `importExport(txtPath, outDir, dateFormat)`, and runs standalone via CLI.
 
 ### Exporting a chat
 
 `exportChat()` (duplicated in both entry points) is the shared core: it walks every loaded message in the date range — not just media — and:
 - downloads attachments of type `image`, `video`, `audio`, `ptt` (voice notes), `document`, and `sticker` into type-specific subfolders
 - writes every message (text and media) to `conversation.txt` in chronological order, with sender name, timestamp, and body/attachment reference
+
+Before any download, every loaded message gets its `id._serialized` backfilled from `id.$1` — WhatsApp Web (July 2026+) renamed the field and whatsapp-web.js 1.34.7 still reads the old name, which otherwise makes `downloadMedia()` fail with an opaque `r: r` error.
 
 This is what makes a full personal-chat export possible, not just its media.
 

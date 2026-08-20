@@ -1,8 +1,87 @@
 const qrcode = require('qrcode-terminal');
-const inquirer = require('inquirer');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
+const { execSync } = require('child_process');
 const PKG = require('./package.json');
+
+// ── ESC = back/exit for every prompt ─────────────────────────────────────
+// inquirer v8 has no "back" key handling. Patch the Base prompt so a `q`
+// keypress resolves the active prompt with a sentinel value; each menu then
+// maps that sentinel to "back"/"exit" instead of making the user scroll to
+// the exit option.
+// `q` is used instead of Esc because Esc needs a 500ms escape-code timeout
+// and is not reliably delivered as a keypress here; `q` fires immediately.
+// Lazy-loaded inside the flow — requiring inquirer up front costs ~11s
+// (rxjs) and would delay the banner.
+let BACK_RESULT = null;
+let activePrompt = null;
+
+function patchInquirerEsc() {
+  const inquirer = require('inquirer');
+  BACK_RESULT = '\u0000__BACK__';
+  readline.emitKeypressEvents(process.stdin);
+
+  // Persistent listener, attached once: keeps the stream's keypress decoder
+  // armed between prompts (readline's emitKeypressEvents self-detaches its
+  // data handler when no 'keypress' listeners remain) and resolves whichever
+  // prompt is currently active. `q` instead of Esc — Esc needs a 500ms
+  // escape-code timeout and is not reliably delivered as a keypress here.
+  // Only list prompts get the keypress interception — they can't accept
+  // typed text, so a bare `q` press is the only way to go back without
+  // scrolling to the Back entry. Input prompts (date, folder, ...) and
+  // confirms take plain text instead: the user types `q` and hits Enter,
+  // and the flow treats the submitted value 'q' as "back"/"no". No ESC.
+  const onQ = (str, key) => {
+    if (!key || key.name !== 'q') return;
+    const p = activePrompt;
+    if (!p) return;
+    if (p.constructor.name !== 'ListPrompt') return;
+    // The decoder (attached before any prompt) emits the keypress before the
+    // prompt's own readline processes the byte, which would insert 'q' into
+    // its line buffer and redraw it right after we resolve — leaking a stray
+    // 'q' into the next rendered prompt. Drop the rl's listeners so it never
+    // sees the byte.
+    p.rl.removeAllListeners();
+    const fn = p.onSubmit ? p.onSubmit.bind(p)
+      : p.onEnd ? p.onEnd.bind(p) : null;
+    if (!fn) return;
+    fn(BACK_RESULT);
+  };
+  process.stdin.setMaxListeners(0);
+  process.stdin.on('keypress', onQ);
+
+  const Base = require('inquirer/lib/prompts/base');
+  const origRun = Base.prototype.run;
+  Base.prototype.run = function () {
+    activePrompt = this;
+    const result = origRun.call(this);
+    const origClose = this.close.bind(this);
+    this.close = () => {
+      if (activePrompt === this) activePrompt = null;
+      return origClose();
+    };
+    return result;
+  };
+
+  // inquirer pauses+closes its readline after every prompt(); the pause
+  // happens AFTER our prompt-level close hook runs, so re-arm the tty at the
+  // very end of the UI close instead — otherwise the next prompt's keypresses
+  // can be dropped in the gap between close and the next createInterface.
+  // Ctrl+C fires this close more than once (puppeteer's SIGINT handler plus
+  // inquirer's signal-exit hook), and the second call would make readline
+  // throw ERR_USE_AFTER_CLOSE — guard + swallow so exits are always clean.
+  const UI = require('inquirer/lib/ui/baseUI');
+  const origUIClose = UI.prototype.close;
+  UI.prototype.close = function () {
+    if (this.__uiClosed) return;
+    this.__uiClosed = true;
+    try { origUIClose.call(this); } catch {}
+    try { process.stdin.setRawMode(true); } catch {}
+    process.stdin.resume();
+  };
+  return inquirer;
+}
 
 const BASE_OUT = process.env.OUTPUT_DIR || __dirname;
 let ChatFactory = null;
@@ -119,13 +198,17 @@ async function loadHistory(chat, targetStartTs) {
     if (limit > 50000) break;
   }
   console.log(` done (${prevCount < 0 ? 0 : prevCount} messages loaded).`);
+  return Math.max(0, prevCount);
 }
 
 // Downloads media files and writes a conversation.txt transcript covering
 // every message (text and media) in range, so personal chats can be
 // exported in full rather than just their attachments.
-async function exportChat(chat, startTs, endTs, outDir) {
-  const all = await chat.fetchMessages({ limit: 99999 });
+async function exportChat(chat, startTs, endTs, outDir, loadedCount = 0) {
+  // Never fetch less than loadHistory() already accumulated, otherwise
+  // "all time" exports of large chats silently truncate the oldest
+  // messages.
+  const all = await chat.fetchMessages({ limit: Math.max(99999, loadedCount) });
   const inRange = all.filter(m => {
     if (startTs && m.timestamp < startTs) return false;
     if (endTs   && m.timestamp > endTs)   return false;
@@ -197,14 +280,37 @@ function printBanner() {
   console.clear();
   const title = `WhatsApp Media Scraper v${PKG.version}`;
   const W = 38;
-  console.log('╔' + '═'.repeat(W) + '╗');
-  console.log('║' + title.padStart(Math.floor((W + title.length) / 2)).padEnd(W) + '║');
-  console.log('╚' + '═'.repeat(W) + '╝\n');
+  console.log('═'.repeat(W));
+  console.log('   ' + title);
+  console.log('═'.repeat(W) + '\n');
 }
 
 // ── Live scrape over WhatsApp Web ───────────────────────────────────────
+// If a previous run was killed mid-execution (Ctrl+C, crash, OOM), the
+// chromium it launched keeps the session dir locked and the next launch
+// fails with "The browser is already running". Clean those stragglers up
+// before starting so the app always boots into a fresh browser.
+function killStaleBrowsers() {
+  try {
+    const out = execSync('ps -eo pid=,args=').toString();
+    for (const line of out.split('\n')) {
+      const m = line.match(/^\s*(\d+)\s+(.+)$/);
+      if (!m) continue;
+      if (/\.wwebjs_auth/.test(m[2]) && /chrome|headless_shell/i.test(m[2])) {
+        try { process.kill(parseInt(m[1], 10), 'SIGKILL'); } catch {}
+      }
+    }
+  } catch {}
+  const sessionDir = path.join(__dirname, '.wwebjs_auth', 'session');
+  try { fs.rmSync(path.join(sessionDir, 'SingletonLock'), { force: true }); } catch {}
+  try { fs.rmSync(path.join(sessionDir, 'DevToolsActivePort'), { force: true }); } catch {}
+}
+
 async function liveScrapeFlow() {
+  killStaleBrowsers();
   console.log('\n── Connecting to WhatsApp Web ──\n');
+  console.log('  • Loading prompts library...');
+  const inquirer = patchInquirerEsc();
   console.log('  • Loading WhatsApp library...');
   const { Client, LocalAuth } = require('whatsapp-web.js');
   console.log('  • Launching browser (Chromium)...');
@@ -230,7 +336,10 @@ async function liveScrapeFlow() {
     });
     client.on('auth_failure', e => reject(new Error('Auth failed: ' + e)));
     client.on('ready', resolve);
-    client.initialize().catch(reject);
+    client.initialize().catch(e => reject(new Error(
+      'WhatsApp session could not be restored (stale or corrupt session data). ' +
+      'Fix: delete the .wwebjs_auth/session folder and scan the QR to re-link.\n' + e
+    )));
   });
 
   console.log('  • Connected — loading chat list...');
@@ -242,6 +351,11 @@ async function liveScrapeFlow() {
 
   while (true) {
     // ── Chat type ─────────────────────────────────────────
+    // This is the app's "main menu" — q deliberately does nothing here
+    // so the app can't be closed accidentally; use ⛔ Exit.
+    // Clear + redraw every time the menu is shown, so no stray keystroke
+    // residue from a previous prompt can linger on screen.
+    printBanner();
     const { chatType } = await inquirer.prompt([{
       type: 'list',
       name: 'chatType',
@@ -254,110 +368,144 @@ async function liveScrapeFlow() {
       ],
     }]);
 
+    if (chatType === BACK_RESULT) { console.clear(); continue; }
     if (chatType === 'exit') break;
     const list = chatType === 'group' ? groups : personalChats;
 
     // ── Chat selection ────────────────────────────────────
-    const { chatName } = await inquirer.prompt([{
-      type: 'list',
-      name: 'chatName',
-      message: chatType === 'group' ? 'Select a group:' : 'Select a personal chat:',
-      choices: [...list.map(c => c.name), new inquirer.Separator(), '⛔  Back'],
-      pageSize: 15,
-    }]);
-
-    if (chatName === '⛔  Back') continue;
-    const group = list.find(c => c.name === chatName);
-    const groupName = chatName;
-
-    // ── Timeframe ────────────────────────────────────────
-    const { timeframe } = await inquirer.prompt([{
-      type: 'list',
-      name: 'timeframe',
-      message: 'Timeframe:',
-      choices: [
-        { name: `Today          (${todayLocal()})`, value: 'today' },
-        { name: `Yesterday      (${yesterdayLocal()})`, value: 'yesterday' },
-        { name: 'Specific date', value: 'date' },
-        { name: 'Date range     (from → to)', value: 'range' },
-        { name: 'All time', value: 'all' },
-      ],
-    }]);
-
-    let startTs = null, endTs = null, label = '';
-
-    if (timeframe === 'today') {
-      const r = parseRange(todayLocal());
-      startTs = r.start; endTs = r.end; label = todayLocal();
-    } else if (timeframe === 'yesterday') {
-      const r = parseRange(yesterdayLocal());
-      startTs = r.start; endTs = r.end; label = yesterdayLocal();
-    } else if (timeframe === 'date') {
-      const { d } = await inquirer.prompt([{
-        type: 'input', name: 'd', message: 'Date (YYYY-MM-DD):',
-        default: todayLocal(),
-        validate: v => isValidDate(v) || 'Enter a valid date (YYYY-MM-DD)',
+    while (true) {
+      const { chatName } = await inquirer.prompt([{
+        type: 'list',
+        name: 'chatName',
+        message: chatType === 'group' ? 'Select a group (q = back):' : 'Select a personal chat (q = back):',
+        // Some contacts have no name set — fall back to their id so the
+        // list never contains undefined entries.
+        choices: [...list.map(c => c.name || c.id._serialized), new inquirer.Separator(), '⛔  Back'],
+        pageSize: 15,
       }]);
-      const r = parseRange(d);
-      startTs = r.start; endTs = r.end; label = d;
-    } else if (timeframe === 'range') {
-      const { from, to } = await inquirer.prompt([
-        { type: 'input', name: 'from', message: 'From date (YYYY-MM-DD):', default: yesterdayLocal(),
-          validate: v => isValidDate(v) || 'Invalid date' },
-        { type: 'input', name: 'to',   message: 'To date   (YYYY-MM-DD):', default: todayLocal(),
-          validate: v => isValidDate(v) || 'Invalid date' },
-      ]);
-      startTs = Math.floor(new Date(from + 'T00:00:00').getTime()/1000);
-      endTs   = Math.floor(new Date(to   + 'T23:59:59').getTime()/1000);
-      label = `${from}_to_${to}`;
-    } else {
-      label = 'all';
+
+      if (chatName === BACK_RESULT || chatName === '⛔  Back') break;
+      const group = list.find(c => (c.name || c.id._serialized) === chatName);
+      const groupName = chatName;
+
+      // ── Timeframe ────────────────────────────────────────
+      while (true) {
+        const { timeframe } = await inquirer.prompt([{
+          type: 'list',
+          name: 'timeframe',
+          message: 'Timeframe (q = back):',
+          choices: [
+            { name: `Today          (${todayLocal()})`, value: 'today' },
+            { name: `Yesterday      (${yesterdayLocal()})`, value: 'yesterday' },
+            { name: 'Specific date', value: 'date' },
+            { name: 'Date range     (from → to)', value: 'range' },
+            { name: 'All time', value: 'all' },
+          ],
+        }]);
+
+        if (timeframe === BACK_RESULT) { console.clear(); break; }
+
+        let startTs = null, endTs = null, label = '';
+
+        if (timeframe === 'today') {
+          const r = parseRange(todayLocal());
+          startTs = r.start; endTs = r.end; label = todayLocal();
+        } else if (timeframe === 'yesterday') {
+          const r = parseRange(yesterdayLocal());
+          startTs = r.start; endTs = r.end; label = yesterdayLocal();
+        } else if (timeframe === 'date') {
+          const { d } = await inquirer.prompt([{
+            type: 'input', name: 'd', message: 'Date (YYYY-MM-DD, q = back):',
+            default: todayLocal(),
+            // 'q' passes the check so typing q + Enter is caught below.
+            validate: v => v === 'q' || isValidDate(v) || 'Enter a valid date (YYYY-MM-DD)',
+          }]);
+          if (d === 'q') { console.clear(); break; }
+          const r = parseRange(d);
+          startTs = r.start; endTs = r.end; label = d;
+        } else if (timeframe === 'range') {
+          const { from, to } = await inquirer.prompt([
+            { type: 'input', name: 'from', message: 'From date (YYYY-MM-DD, q = back):', default: yesterdayLocal(),
+              validate: v => v === 'q' || isValidDate(v) || 'Invalid date' },
+            { type: 'input', name: 'to',   message: 'To date   (YYYY-MM-DD, q = back):', default: todayLocal(),
+              validate: v => v === 'q' || isValidDate(v) || 'Invalid date' },
+          ]);
+          if (from === 'q' || to === 'q') { console.clear(); break; }
+          startTs = Math.floor(new Date(from + 'T00:00:00').getTime()/1000);
+          endTs   = Math.floor(new Date(to   + 'T23:59:59').getTime()/1000);
+          label = `${from}_to_${to}`;
+        } else {
+          label = 'all';
+        }
+
+        // ── Output folder ──────────────────────────────────
+        const defaultFolder = label === 'all'
+          ? groupName.replace(/[^a-zA-Z0-9]/g, '_').slice(0,20)
+          : label.replace(/-/g,'');
+
+        const { folder } = await inquirer.prompt([{
+          type: 'input', name: 'folder',
+          message: 'Output folder name (q = back):',
+          default: defaultFolder,
+          // Keep the name inside the output root — no path separators or
+          // traversal. 'q' passes so typing q + Enter is caught below.
+          validate: v => v === 'q' || (/^[\w .\-+()]+$/.test(v.trim()) && v.trim().length > 0 || 'Folder name: letters, numbers, space, . - _ + ( ) only'),
+        }]);
+        if (folder === 'q') { console.clear(); break; }
+
+        const outDir = path.join(BASE_OUT, folder.trim());
+
+        // ── Confirm ────────────────────────────────────────
+        console.log('\n  ┌─────────────────────────────────────┐');
+        console.log(`    Chat:    ${groupName}`);
+        console.log(`    Range:   ${label||'all time'}`);
+        console.log(`    Output:  ${folder.trim()}`);
+        console.log('  └─────────────────────────────────────┘\n');
+
+        const { ok } = await inquirer.prompt([{
+          type: 'confirm', name: 'ok', message: 'Start export? (q = no)', default: true,
+        }]);
+
+        if (ok === true) {
+          ensureDir(outDir);
+          const loaded = await loadHistory(group, startTs);
+          const { saved, total } = await exportChat(group, startTs, endTs, outDir, loaded);
+          console.log(`\n  ✓ Done — ${saved} file(s) + conversation.txt (${total} messages) saved to:\n    ${outDir}\n`);
+        }
+
+        // ── Pause ──────────────────────────────────────────
+        // Lets the user read the result before the screen clears.
+        // Either answer returns to the same-type chat list (group stays
+        // group, personal stays personal) so consecutive purges are quick.
+        // q at the chat list goes back to the main menu, which is the only
+        // place the app exits (⛔ Exit).
+        await inquirer.prompt([{
+          type: 'input', name: '_', message: 'Press Enter to continue',
+        }]);
+
+        // ── Back to this chat list ─────────────────────────
+        printBanner();
+        break; // out of the timeframe loop → chat list re-renders
+      }
     }
-
-    // ── Output folder ────────────────────────────────────
-    const defaultFolder = label === 'all'
-      ? groupName.replace(/[^a-zA-Z0-9]/g, '_').slice(0,20)
-      : label.replace(/-/g,'');
-
-    const { folder } = await inquirer.prompt([{
-      type: 'input', name: 'folder',
-      message: 'Output folder name:',
-      default: defaultFolder,
-      validate: v => v.trim().length > 0 || 'Enter a folder name',
-    }]);
-
-    const outDir = path.join(BASE_OUT, folder.trim());
-
-    // ── Confirm ──────────────────────────────────────────
-    console.log('\n  ┌─────────────────────────────────────┐');
-    console.log(`  │ Chat:    ${groupName.padEnd(28)}│`);
-    console.log(`  │ Range:   ${(label||'all time').padEnd(28)}│`);
-    console.log(`  │ Output:  ${folder.trim().padEnd(28)}│`);
-    console.log('  └─────────────────────────────────────┘\n');
-
-    const { ok } = await inquirer.prompt([{
-      type: 'confirm', name: 'ok', message: 'Start export?', default: true,
-    }]);
-
-    if (ok) {
-      ensureDir(outDir);
-      await loadHistory(group, startTs);
-      const { saved, total } = await exportChat(group, startTs, endTs, outDir);
-      console.log(`\n  ✓ Done — ${saved} file(s) + conversation.txt (${total} messages) saved to:\n    ${outDir}\n`);
-    }
-
-    // ── Continue? ────────────────────────────────────────
-    const { again } = await inquirer.prompt([{
-      type: 'confirm', name: 'again', message: 'Scrape another chat/date?', default: true,
-    }]);
-    if (!again) break;
-    printBanner();
   }
 
   await client.destroy();
 }
 
 // ── Entry point ────────────────────────────────────────────────────────
+// Catch everything: an unexpected error should never dump a raw stack and
+// leave the terminal in a broken state — print a short message, restore the
+// tty, and exit.
+process.on('uncaughtException', e => {
+  console.error('\n⚠ Unexpected error: ' + (e && e.message ? e.message : e) + '\n');
+  process.exit(1);
+});
+process.on('unhandledRejection', e => {
+  console.error('\n⚠ Unhandled error: ' + (e && e.message ? e.message : e) + '\n');
+  process.exit(1);
+});
+
 async function main() {
   printBanner();
   await liveScrapeFlow();

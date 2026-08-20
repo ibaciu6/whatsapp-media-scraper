@@ -20,7 +20,7 @@ jobs:
       - run: npm ci
 
       - name: Syntax check
-        run: node --check index.js && node --check menu.js
+        run: node --check index.js && node --check menu.js && node --check import-export.js
 
       - name: Dependency audit
         run: npm audit --audit-level=critical

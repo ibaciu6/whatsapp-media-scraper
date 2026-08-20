@@ -1,10 +1,11 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const ChatFactory = require('whatsapp-web.js/src/factories/ChatFactory');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
 
+let ChatFactory = null;
+
 async function getChatsCompat(client) {
+  if (!ChatFactory) ChatFactory = require('whatsapp-web.js/src/factories/ChatFactory');
   const models = await client.pupPage.evaluate(async () => {
     const messages = window.require('WAWebCollections').Msg;
     const originalGetMessagesById = messages.getMessagesById;
@@ -82,6 +83,10 @@ const folderArg = process.argv[4] || null;
 // Parse date range (local timezone = Bucharest)
 let startTs = null, endTs = null;
 if (dateArg) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateArg) || isNaN(new Date(dateArg + 'T00:00:00'))) {
+    console.error(`[ERR] Invalid date: "${dateArg}" — expected YYYY-MM-DD`);
+    process.exit(1);
+  }
   const d = new Date(dateArg + 'T00:00:00');
   const e = new Date(dateArg + 'T23:59:59');
   startTs = Math.floor(d.getTime() / 1000);
@@ -142,13 +147,17 @@ async function loadHistory(chat, targetStartTs) {
     if (limit > 50000) break; // safety cap
   }
   console.log(` done (${prevCount < 0 ? 0 : prevCount} messages loaded).`);
+  return Math.max(0, prevCount);
 }
 
 // Downloads media files and writes a conversation.txt transcript covering
 // every message (text and media) in range, so personal chats can be
 // exported in full rather than just their attachments.
-async function exportChat(chat, startTs, endTs, outDir) {
-  const all = await chat.fetchMessages({ limit: 99999 });
+async function exportChat(chat, startTs, endTs, outDir, loadedCount = 0) {
+  // Never fetch less than loadHistory() already accumulated, otherwise
+  // "all time" exports of large chats silently truncate the oldest
+  // messages.
+  const all = await chat.fetchMessages({ limit: Math.max(99999, loadedCount) });
   const inRange = all.filter(m => {
     if (startTs && m.timestamp < startTs) return false;
     if (endTs   && m.timestamp > endTs)   return false;
@@ -218,6 +227,8 @@ async function exportChat(chat, startTs, endTs, outDir) {
 
 console.log('[INFO] Launching browser (Chromium)... this can take a while');
 
+const { Client, LocalAuth } = require('whatsapp-web.js');
+
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.wwebjs_auth') }),
   puppeteer: {
@@ -271,9 +282,9 @@ client.on('ready', async () => {
   ensureDir(outDir);
 
   // Load history back to start date
-  await loadHistory(group, startTs);
+  const loaded = await loadHistory(group, startTs);
 
-  const { saved, total } = await exportChat(group, startTs, endTs, outDir);
+  const { saved, total } = await exportChat(group, startTs, endTs, outDir, loaded);
 
   console.log(`\n[DONE] ${saved} file(s) + conversation.txt (${total} messages) saved to ${outDir}`);
   await client.destroy();

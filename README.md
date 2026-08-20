@@ -43,6 +43,12 @@ while the browser launches and the session connects):
 4. **Output folder** — name for the export folder (auto-suggested from the date)
 5. **Confirmation** — shows a summary before starting
 
+Navigation: press `q` to go back one step (on lists it works as a hotkey; on
+date/folder inputs type `q` and press Enter), and the export summary's
+`q = no` skips the scrape. The app never exits on its own — after a scrape it
+pauses, then returns you to the same chat list for another round. The only way
+out is `⛔  Exit` in the main menu (or Ctrl+C, which aborts cleanly).
+
 The client stays connected so you can scrape multiple chats or dates without re-authenticating.
 
 ### CLI
