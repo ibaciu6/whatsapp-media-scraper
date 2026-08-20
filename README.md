@@ -64,8 +64,7 @@ Name matching is case-insensitive and partial, and matches groups or personal ch
 this linked device, and media is only downloadable while it still lives on
 WhatsApp's CDN (a retention window of weeks, not years). For complete history —
 including media WhatsApp's servers have long since expired — export the chat
-from your phone instead (the import entry point was removed from `menu.js`;
-use the standalone script below):
+from your phone instead:
 
 1. Open the chat on your phone → ⋮ (or contact/group name) → **Export chat** → **Include media**
 2. Transfer the resulting `.zip` to this machine and unzip it
