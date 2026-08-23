@@ -1,294 +1,323 @@
-const qrcode = require('qrcode-terminal');
-const fs = require('fs');
+#!/usr/bin/env node
+// Headless CLI scraper. All shared logic lives in lib/; fast paths below
+// (--help, --version, account admin, cached name checks) run BEFORE
+// whatsapp-web.js is ever required, so they never launch Chromium.
 const path = require('path');
+const core = require('./lib/core');
+const scrape = require('./lib/scrape');
+const PKG = require('./package.json');
 
-let ChatFactory = null;
+const HELP_TEXT = `WhatsApp Media Scraper v${PKG.version} — CLI
 
-async function getChatsCompat(client) {
-  if (!ChatFactory) ChatFactory = require('whatsapp-web.js/src/factories/ChatFactory');
-  const models = await client.pupPage.evaluate(async () => {
-    const messages = window.require('WAWebCollections').Msg;
-    const originalGetMessagesById = messages.getMessagesById;
+Usage:
+  node index.js                                        list chats (current account)
+  node index.js "Chat Name"                            export all time
+  node index.js "Chat Name" today                      export today
+  node index.js "Chat Name" yesterday                  export yesterday
+  node index.js "Chat Name" 2026-06-13                 export a single date
+  node index.js "Chat Name" 2026-06-01 2026-06-30      export an inclusive range
+  node index.js "Chat Name" all "My Label"             custom folder label
+  node index.js --all-chats today --text-only          batch: every chat in range
 
-    // WhatsApp Web may expose lastReceivedKey without the legacy _serialized
-    // field. whatsapp-web.js 1.34.7 otherwise sends [undefined] to IndexedDB.
-    messages.getMessagesById = function(ids, ...args) {
-      if (!Array.isArray(ids) || ids.some(id => !id)) {
-        return Promise.resolve({ messages: [] });
-      }
-      return originalGetMessagesById.call(this, ids, ...args);
-    };
+Options:
+  --account <name>        use a specific saved account
+  --all-chats             export EVERY chat with the chosen date/scope
+  --text-only             transcript only — skip media downloads
+  --media-types <list>    comma list: image,video,audio,ptt,document,sticker
+  --include-broadcast     also include status/broadcast channels
+  --timezone <tz>         IANA zone for date boundaries (e.g. Europe/Berlin);
+                          the TZ env var works too and applies everywhere
+  --output-dir <path>     set the download root (persists to config)
+  --show-output-dir       print current download root and exit
+  --list-accounts         list saved accounts and exit
+  --disconnect <name>     delete an account's session data and exit
+  -h, --help              this help
+  -v, --version           version
 
-    try {
-      return await window.WWebJS.getChats();
-    } finally {
-      messages.getMessagesById = originalGetMessagesById;
-    }
-  });
+Output layout:
+  <download-root>/<ChatName>/<date>_<session>/
+    conversation.txt + images/ videos/ audio/ documents/ stickers/ other/
 
-  return models.map(model => ChatFactory.create(client, model));
-}
+Interrupted exports resume: re-run the same command into the same folder and
+the transcript continues where it stopped (.export-meta.json sidecar).`;
 
-const MIME_TO_EXT = {
-  'image/jpeg': '.jpg',
-  'image/jpg': '.jpg',
-  'image/png': '.png',
-  'image/gif': '.gif',
-  'image/webp': '.webp',
-  'video/mp4': '.mp4',
-  'video/3gpp': '.3gp',
-  'video/quicktime': '.mov',
-  'video/x-matroska': '.mkv',
-  'video/webm': '.webm',
-  'audio/ogg': '.ogg',
-  'audio/mpeg': '.mp3',
-  'audio/mp4': '.m4a',
-  'audio/aac': '.aac',
-  'audio/amr': '.amr',
-  'application/pdf': '.pdf',
-};
-
-function extFromMime(mimetype) {
-  if (!mimetype) return '.bin';
-  const base = mimetype.split(';')[0].trim().toLowerCase();
-  return MIME_TO_EXT[base] || '.' + base.split('/')[1];
-}
-
-// Message types worth saving as files, and the subfolder each goes in.
-const MEDIA_SUBDIR = {
-  image: 'images', video: 'videos',
-  audio: 'audio', ptt: 'audio',
-  document: 'documents', sticker: 'stickers',
-};
-
-async function senderLabel(msg, chat) {
-  if (msg.fromMe) return 'Me';
-  if (!chat.isGroup) return chat.name || 'Contact';
-  try {
-    const contact = await msg.getContact();
-    return contact.pushname || contact.name || contact.number || msg.author || 'Unknown';
-  } catch {
-    return msg.author || 'Unknown';
+async function main() {
+  // Accept both "--flag value" and "--flag=value" for value-taking flags
+  // (parity with import-export.js). Only known value-flags are split, so a
+  // typo like "--media-types=image" still fails loudly as an unknown option…
+  // but "--all-chats=x" correctly reports a stray "x" positional instead.
+  const VALUE_FLAGS = ['--account', '--disconnect', '--output-dir', '--media-types', '--timezone'];
+  const argv = [];
+  for (const raw of process.argv.slice(2)) {
+    const vf = VALUE_FLAGS.find(f => raw.startsWith(f + '='));
+    if (vf) { argv.push(vf, raw.slice(vf.length + 1)); }
+    else argv.push(raw);
   }
-}
+  const opts = {
+    account: null, disconnect: null, outputDir: null, mediaTypes: null,
+    textOnly: false, listAccounts: false, showOutputDir: false,
+    allChats: false, includeBroadcast: false, timezone: null,
+    name: null, dateFrom: null, dateTo: null, folder: null,
+  };
+  const seen = new Set();
 
-// CLI: node index.js                              → list groups + personal chats
-//      node index.js "name"                       → export all media + conversation.txt (group or personal chat)
-//      node index.js "name" "2026-06-13"          → limited to that date only
-//      node index.js "name" "2026-06-13" "Folder" → save to named folder
-const groupArg  = process.argv[2] ? process.argv[2].toLowerCase() : null;
-const dateArg   = process.argv[3] || null;
-const folderArg = process.argv[4] || null;
+  const fail = msg => {
+    console.error(`[ERR] ${msg}`);
+    console.error(`      Run "node index.js --help" for usage.`);
+    process.exit(1);
+  };
 
-// Parse date range (local timezone = Bucharest)
-let startTs = null, endTs = null;
-if (dateArg) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateArg) || isNaN(new Date(dateArg + 'T00:00:00'))) {
-    console.error(`[ERR] Invalid date: "${dateArg}" — expected YYYY-MM-DD`);
+  // ── Timezone must be applied before any Date is created ───────────────
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--timezone') {
+      const tz = argv[i + 1];
+      if (!tz || tz.startsWith('-')) fail('"--timezone" needs an IANA zone, e.g. Europe/Berlin');
+      try { new Intl.DateTimeFormat('en', { timeZone: tz }); }
+      catch { fail(`Unknown timezone "${tz}"`); }
+      opts.timezone = tz;
+      process.env.TZ = tz;
+      break;
+    }
+  }
+
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--') || a === '-h' || a === '-v') {
+      const canon = a === '-h' ? '--help' : a === '-v' ? '--version' : a;
+      if (!['--account', '--disconnect', '--output-dir', '--media-types',
+        '--list-accounts', '--show-output-dir', '--text-only', '--all-chats',
+        '--include-broadcast', '--timezone', '--help', '--version'].includes(canon))
+        fail(`Unknown option "${a}"`);
+      if (seen.has(canon) && !['--help', '--version'].includes(canon))
+        console.error(`[WARN] "${canon}" given more than once — using the last value.`);
+      seen.add(canon);
+
+      if (canon === '--help') { console.log(HELP_TEXT); return; }
+      if (canon === '--version') { console.log(PKG.version); return; }
+      if (canon === '--text-only') { opts.textOnly = true; continue; }
+      if (canon === '--all-chats') { opts.allChats = true; continue; }
+      if (canon === '--include-broadcast') { opts.includeBroadcast = true; continue; }
+      if (canon === '--list-accounts') { opts.listAccounts = true; continue; }
+      if (canon === '--show-output-dir') { opts.showOutputDir = true; continue; }
+      if (canon === '--timezone') { i++; continue; }   // already handled above
+
+      // Flags that consume a value must not swallow another flag.
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) fail(`"${canon}" needs a value`);
+      i++;
+      if (canon === '--account') opts.account = next;
+      else if (canon === '--disconnect') opts.disconnect = next;
+      else if (canon === '--output-dir') opts.outputDir = next;
+      else if (canon === '--media-types') opts.mediaTypes = next;
+    } else if (!opts.name) {
+      opts.name = a;
+    } else if (core.isValidDate(a) || /^(today|yesterday|all)$/i.test(a)) {
+      if (!opts.dateFrom) opts.dateFrom = a.toLowerCase();
+      else if (!opts.dateTo) opts.dateTo = a.toLowerCase();
+      else if (!opts.folder) opts.folder = a;
+    } else if (!opts.folder) {
+      opts.folder = a;
+    }
+  }
+
+  // ── Fast paths — no browser launched ─────────────────────────────────
+  if (opts.showOutputDir) { console.log(core.getBaseOutputDir()); return; }
+
+  if (opts.outputDir) {
+    const err = core.validateOutputDir(opts.outputDir);
+    if (err) fail(err);
+    core.setBaseOutputDir(path.resolve(opts.outputDir.trim()));
+    console.log(`[OK] Download location set to: ${path.resolve(opts.outputDir.trim())}`);
+    if (!opts.name && !opts.allChats) return;     // setting-only invocation
+  }
+
+  if (opts.listAccounts) {
+    const accounts = core.listAccounts();
+    const current = core.getCurrentAccount();
+    console.log('=== Accounts ===');
+    if (!accounts.length) console.log('  (none)');
+    for (const a of accounts) console.log(`  ${a}${a === current ? '  (current)' : ''}`);
+    return;
+  }
+
+  if (opts.disconnect) {
+    if (!core.accountExists(opts.disconnect)) fail(`Account "${opts.disconnect}" does not exist`);
+    core.deleteAccount(opts.disconnect);
+    if (core.getCurrentAccount() === opts.disconnect) core.clearCurrentAccount();
+    console.log(`[OK] Account "${opts.disconnect}" disconnected.`);
+    return;
+  }
+
+  // ── Date range resolution ────────────────────────────────────────────
+  let startTs = null, endTs = null, label = 'all';
+  if (opts.dateFrom && opts.dateFrom !== 'all') {
+    const fromStr = opts.dateFrom === 'today' ? core.todayLocal()
+      : opts.dateFrom === 'yesterday' ? core.yesterdayLocal() : opts.dateFrom;
+    let toStr = fromStr;
+    if (opts.dateTo) {
+      toStr = opts.dateTo === 'today' ? core.todayLocal()
+        : opts.dateTo === 'yesterday' ? core.yesterdayLocal() : opts.dateTo;
+    }
+    startTs = Math.floor(new Date(fromStr + 'T00:00:00').getTime() / 1000);
+    endTs = Math.floor(new Date(toStr + 'T23:59:59').getTime() / 1000);
+    if (startTs > endTs) fail(`Date range inverted: ${fromStr} → ${toStr}`);
+    label = fromStr === toStr ? fromStr : `${fromStr}_to_${toStr}`;
+  }
+
+  // Media type filter
+  let mediaTypes = null;
+  if (opts.mediaTypes) {
+    const valid = new Set(Object.keys(core.MEDIA_SUBDIR));
+    mediaTypes = opts.mediaTypes.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const bad = mediaTypes.filter(t => !valid.has(t));
+    if (bad.length) fail(`Unknown media type(s): ${bad.join(', ')}. Valid: ${[...valid].join(', ')}`);
+    if (!mediaTypes.length) mediaTypes = null;
+  }
+
+  const accountName = opts.account || core.getCurrentAccount();
+
+  // ── Chat-name fast-fail via cache (no Chromium needed to reject typos) ─
+  if (opts.name && !opts.allChats && accountName && !core.accountExists(accountName)) {
+    fail(`Account "${accountName}" does not exist (see --list-accounts)`);
+  }
+  if (opts.name && !opts.allChats && accountName) {
+    const cache = core.loadChatCache(accountName);
+    if (cache && cache.chats.length) {
+      const needle = opts.name.toLowerCase();
+      const hit = cache.chats.some(c =>
+        ((c.name || '') + ' ' + c.id.split('@')[0]).toLowerCase().includes(needle));
+      if (!hit) {
+        console.error(`[ERR] No chat matching "${opts.name}" in the cached list ` +
+          `for account "${accountName}" (${cache.chats.length} chats, saved ${core.relTime(cache.savedAt)}).`);
+        console.error('      If the chat is brand-new, run once without this name to refresh the cache.');
+        process.exit(1);
+      }
+    }
+  }
+
+  // ── Connect & export ─────────────────────────────────────────────────
+  scrape.killStaleBrowsers();
+
+  const lockFile = accountName ? core.acquireAccountLock(accountName) : null;
+  if (accountName && !lockFile) {
+    console.error(`[ERR] Account "${accountName}" is in use by another process.`);
+    console.error('      Close the other session (or wait 6h for the stale lock to expire).');
     process.exit(1);
   }
-  const d = new Date(dateArg + 'T00:00:00');
-  const e = new Date(dateArg + 'T23:59:59');
-  startTs = Math.floor(d.getTime() / 1000);
-  endTs   = Math.floor(e.getTime() / 1000);
-  console.log(`[INFO] Date filter: ${d.toLocaleString()} → ${e.toLocaleString()}`);
-}
 
-// Output directory
-const outDir = folderArg
-  ? path.join(__dirname, folderArg)
-  : path.join(__dirname, 'media');
+  const scopeOpts = { textOnly: opts.textOnly, mediaTypes };
+  let client = null;
+  try {
+    console.log('[INFO] Launching browser (Chromium)…');
+    if (accountName) console.log(`[INFO] Using account: ${accountName}` +
+      (opts.timezone ? ` · timezone: ${opts.timezone}` : ''));
+    client = await scrape.connectClient(accountName);
+    console.log('[OK] WhatsApp ready.');
 
-function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
+    const chats = await scrape.getChatsCompat(client);
+    scrape.cacheChats(accountName, chats);
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    const keepId = id => id !== 'status@broadcast';
+    const groups = chats.filter(c => c.isGroup);
+    const personalChats = chats.filter(c => !c.isGroup &&
+      (keepId(c.id._serialized || c.id.$1) || opts.includeBroadcast));
 
-// Load all messages back to targetStartTs by calling fetchMessages with
-// an ever-increasing limit — each call triggers whatsapp-web.js's own
-// loadEarlierMsgs when in-memory count < limit.
-//
-// WhatsApp Web only has as much history as it has synced from the phone over
-// the multi-device link. A stalled message count doesn't mean history is
-// exhausted — the phone may need a few retries (with delay) to push the next
-// older batch, especially for chats with years of backlog. Only give up
-// after several consecutive stalls.
-async function loadHistory(chat, targetStartTs) {
-  // Mimics opening the chat in the real app/UI, which is what actually
-  // prompts the phone to push older history over the multi-device link —
-  // fetchMessages()/loadEarlierMsgs() alone only page through what's
-  // already synced locally.
-  await chat.sendSeen();
-  await sleep(2000);
+    if (!opts.name && !opts.allChats) {
+      console.log('=== YOUR GROUPS ===');
+      groups.forEach((g, i) => console.log(`  ${i + 1}. ${g.name || `Unnamed Group (${scrape.getDisplayName(g)})`}`));
+      console.log('\n=== YOUR PERSONAL CHATS ===');
+      personalChats.forEach((c, i) => console.log(`  ${i + 1}. ${scrape.getDisplayName(c)}`));
+      console.log('\nRun "node index.js --help" for usage.');
+      return;
+    }
 
-  process.stdout.write('[INFO] Loading message history');
-  let limit = 100, prevCount = -1, stalls = 0;
-  const MAX_STALLS = 6;
-
-  while (true) {
-    const msgs = await chat.fetchMessages({ limit });
-    process.stdout.write('.');
-
-    if (!msgs || msgs.length === 0) break;
-
-    if (msgs.length === prevCount) {
-      stalls++;
-      if (stalls >= MAX_STALLS) break;
-      await sleep(1500);
+    const targets = [];
+    if (opts.allChats) {
+      if (opts.name) console.log(`[WARN] --all-chats given; ignoring chat name "${opts.name}".`);
+      targets.push(...groups, ...personalChats);
+      console.log(`[INFO] Batch mode: exporting ${targets.length} chat(s).`);
     } else {
-      stalls = 0;
-    }
-    prevCount = msgs.length;
-
-    const oldest = msgs[0];
-    // Reached (or passed) our target start date
-    if (targetStartTs && oldest.timestamp <= targetStartTs) break;
-
-    limit += 100;
-    if (limit > 50000) break; // safety cap
-  }
-  console.log(` done (${prevCount < 0 ? 0 : prevCount} messages loaded).`);
-  return Math.max(0, prevCount);
-}
-
-// Downloads media files and writes a conversation.txt transcript covering
-// every message (text and media) in range, so personal chats can be
-// exported in full rather than just their attachments.
-async function exportChat(chat, startTs, endTs, outDir, loadedCount = 0) {
-  // Never fetch less than loadHistory() already accumulated, otherwise
-  // "all time" exports of large chats silently truncate the oldest
-  // messages.
-  const all = await chat.fetchMessages({ limit: Math.max(99999, loadedCount) });
-  const inRange = all.filter(m => {
-    if (startTs && m.timestamp < startTs) return false;
-    if (endTs   && m.timestamp > endTs)   return false;
-    return true;
-  });
-  for (const msg of inRange) {
-    // WhatsApp Web (July 2026+) renamed the serialized message id from
-    // `_serialized` to `$1`; whatsapp-web.js 1.34.7 still reads the old name
-    // and passes `undefined` into the page, making downloadMedia() fail with
-    // a cryptic `r: r` error. Backfill so the library sees the id it expects.
-    if (msg.id && msg.id._serialized == null && msg.id.$1 != null) {
-      msg.id._serialized = msg.id.$1;
-    }
-  }
-
-  if (!inRange.length) { console.log('[INFO] No messages found for this range.'); return { saved: 0, total: 0 }; }
-  console.log(`[INFO] ${inRange.length} message(s) in range.\n`);
-
-  const transcriptLines = [];
-  let saved = 0;
-
-  for (let i = 0; i < inRange.length; i++) {
-    const msg = inRange[i];
-    const ts = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleString() : `msg${i}`;
-    const who = await senderLabel(msg, chat);
-    const subdir = MEDIA_SUBDIR[msg.type];
-
-    if (msg.hasMedia && subdir) {
-      try {
-        const m = await msg.downloadMedia();
-        if (!m || !m.data) {
-          console.log(`  [${i + 1}/${inRange.length}] skip (no data)`);
-          transcriptLines.push(`[${ts}] ${who}: [${msg.type} attachment - download failed]`);
-          continue;
+      // Exact match → unique partial → interactive pick on ambiguity.
+      const needle = opts.name.toLowerCase();
+      const allChats = [...groups, ...personalChats];
+      let group = allChats.find(c => scrape.getDisplayName(c).toLowerCase() === needle);
+      if (!group) {
+        const matches = allChats.filter(c => scrape.getDisplayName(c).toLowerCase().includes(needle));
+        if (matches.length === 1) group = matches[0];
+        else if (matches.length > 1) {
+          console.log(`[INFO] Multiple chats match "${opts.name}":`);
+          matches.forEach((m, idx) => console.log(`  ${idx + 1}. ${scrape.getDisplayName(m)} (${(m.id._serialized || m.id.$1 || '?').split('@')[0]})`));
+          if (!process.stdin.isTTY) {
+            console.error('[ERR] Re-run with a more specific name.');
+            process.exitCode = 1;
+            return;
+          }
+          const readline = require('readline/promises');
+          const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+          const ans = (await rl.question('Pick 1-' + matches.length + ': ')).trim();
+          rl.close();
+          const pick = parseInt(ans, 10);
+          if (!(pick >= 1 && pick <= matches.length)) { console.error('[ERR] Invalid choice.'); process.exitCode = 1; return; }
+          group = matches[pick - 1];
         }
-        const dir = path.join(outDir, subdir);
-        ensureDir(dir);
-        const fileTs = new Date(msg.timestamp * 1000).toISOString().replace(/[:.]/g, '-');
-        const ext = m.filename ? path.extname(m.filename) || extFromMime(m.mimetype) : extFromMime(m.mimetype);
-        const filename = `${fileTs}_${i}${ext}`;
-        const fp = path.join(dir, filename);
-        if (fs.existsSync(fp)) {
-          console.log(`  [${i + 1}/${inRange.length}] skip (exists): ${filename}`);
-        } else {
-          fs.writeFileSync(fp, Buffer.from(m.data, 'base64'));
-          console.log(`  [${i + 1}/${inRange.length}] ${filename}`);
-        }
-        saved++;
-        const caption = msg.body ? ` - "${msg.body}"` : '';
-        transcriptLines.push(`[${ts}] ${who}: [${subdir}/${filename}]${caption}`);
-      } catch (err) {
-        console.log(`  [${i + 1}/${inRange.length}] error: ${err.message}`);
-        transcriptLines.push(`[${ts}] ${who}: [${msg.type} attachment - download failed: ${err.message}]`);
       }
-    } else if (msg.hasMedia) {
-      transcriptLines.push(`[${ts}] ${who}: [unsupported attachment type: ${msg.type}]`);
-    } else {
-      transcriptLines.push(`[${ts}] ${who}: ${msg.body}`);
+      if (!group) { console.error(`[ERR] No chat matching "${opts.name}"`); process.exitCode = 1; return; }
+      targets.push(group);
     }
+
+    // ── Export loop (single or batch) ────────────────────────────────────
+    const baseOut = core.getBaseOutputDir();
+    const sessionId = `${label.replace(/-/g, '')}_${core.sessionSuffix()}`;
+    const results = [], failures = [];
+
+    for (let t = 0; t < targets.length; t++) {
+      const chat = targets[t];
+      const displayName = scrape.getDisplayName(chat);
+      const safeName = core.sanitizeName(displayName);
+      const outDir = opts.folder
+        ? path.join(baseOut, safeName, core.sanitizeName(opts.folder), `${sessionId}${targets.length > 1 ? `_${t + 1}` : ''}`)
+        : path.join(baseOut, safeName, sessionId);
+
+      console.log(`\n[${t + 1}/${targets.length}] Chat: "${displayName}"`);
+      console.log(`[INFO] Output: ${outDir}`);
+      if (!core.ensureDir(outDir)) { failures.push([displayName, 'cannot create output dir']); continue; }
+
+      try {
+        const loaded = await scrape.loadHistory(chat, startTs);
+        const r = await scrape.exportChat(chat, { startTs, endTs, outDir, loadedCount: loaded, ...scopeOpts });
+        results.push([displayName, r]);
+        if (r.resumed === 'complete') console.log(`[DONE] Already exported — skipped.`);
+        else console.log(`[DONE] ${r.saved} file(s)` +
+          (r.skippedExisting ? `, ${r.skippedExisting} existed` : '') +
+          ` · conversation.txt (${r.total} msgs) → ${outDir}` +
+          (r.resumed === 'resumed' ? ' [resumed]' : ''));
+      } catch (e) {
+        failures.push([displayName, e.message]);
+        console.error(`[ERR] ${displayName}: ${e.message} — continuing.`);
+      }
+    }
+
+    if (targets.length > 1) {
+      console.log(`\n===== BATCH SUMMARY =====`);
+      for (const [name, r] of results)
+        console.log(`  ✓ ${name}: ${r.saved} file(s), ${r.total} msgs` +
+          (r.resumed === 'resumed' ? ' [resumed]' : ''));
+      for (const [name, why] of failures)
+        console.log(`  ✗ ${name}: ${why}`);
+      console.log(`=========================`);
+      if (failures.length) process.exitCode = 1;
+    }
+  } finally {
+    if (client) { try { await client.destroy(); } catch {} }
+    if (lockFile) core.releaseAccountLock(lockFile);
   }
-
-  ensureDir(outDir);
-  fs.writeFileSync(path.join(outDir, 'conversation.txt'), transcriptLines.join('\n') + '\n');
-
-  return { saved, total: inRange.length };
 }
 
-console.log('[INFO] Launching browser (Chromium)... this can take a while');
+if (require.main === module) {
+  main().catch(e => {
+    console.error('[ERR] ' + (e && e.message ? e.message : e));
+    process.exit(1);
+  });
+}
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
-
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.wwebjs_auth') }),
-  puppeteer: {
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-  },
-});
-
-let authed = false;
-// The 'authenticated' event can fire more than once during session
-// restore — only report the first one.
-client.on('authenticated', () => {
-  if (authed) return;
-  authed = true;
-  console.log('[OK] Authenticated — resolving session, syncing chats...');
-});
-client.on('qr', qr => {
-  console.log('\n[QR] Scan with WhatsApp → Linked Devices → Link a Device:\n');
-  qrcode.generate(qr, { small: true });
-  console.log('\nWaiting for scan...');
-});
-
-client.on('auth_failure', msg => { console.error('[ERR] Auth failed:', msg); process.exit(1); });
-
-client.on('ready', async () => {
-  console.log('[OK] WhatsApp ready.\n');
-
-  const chats = await getChatsCompat(client);
-  const groups = chats.filter(c => c.isGroup);
-  const personalChats = chats.filter(c => !c.isGroup && c.id._serialized !== 'status@broadcast');
-
-  if (!groupArg) {
-    console.log('=== YOUR GROUPS ===');
-    groups.forEach((g, i) => console.log(`  ${i + 1}. ${g.name}`));
-    console.log('\n=== YOUR PERSONAL CHATS ===');
-    personalChats.forEach((c, i) => console.log(`  ${i + 1}. ${c.name}`));
-    console.log('\nUsage: node index.js "Name" ["YYYY-MM-DD"] ["OutputFolder"]');
-    await client.destroy();
-    return;
-  }
-
-  const group = [...groups, ...personalChats].find(c => c.name.toLowerCase().includes(groupArg));
-  if (!group) {
-    console.log(`[ERR] No chat matching "${groupArg}"`);
-    await client.destroy();
-    return;
-  }
-
-  console.log(`[OK] Chat: "${group.name}"`);
-  console.log(`[INFO] Output: ${outDir}\n`);
-  ensureDir(outDir);
-
-  // Load history back to start date
-  const loaded = await loadHistory(group, startTs);
-
-  const { saved, total } = await exportChat(group, startTs, endTs, outDir, loaded);
-
-  console.log(`\n[DONE] ${saved} file(s) + conversation.txt (${total} messages) saved to ${outDir}`);
-  await client.destroy();
-  process.exit(0);
-});
-
-client.initialize();
+module.exports = { main };

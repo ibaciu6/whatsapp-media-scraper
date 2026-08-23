@@ -1,13 +1,14 @@
 # whatsapp-media-scraper
 
 Export a full WhatsApp conversation — groups and personal (1:1) chats — as a
-chronological transcript plus every media attachment (images, videos, audio/voice
-notes, documents, stickers), filtered by date, date range, or all time. Session
-persists so you only scan the QR code once.
+chronological transcript plus every media attachment (images, videos,
+audio/voice notes, documents, stickers), filtered by date, date range, or all
+time. Multiple accounts are supported with instant switching; each session
+persists so you only scan the QR code once per account.
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 18+ (see `engines` in package.json)
 - Chromium (installed automatically by Puppeteer via `npm install`)
 - A WhatsApp account with access to the target chat
 
@@ -17,10 +18,13 @@ persists so you only scan the QR code once.
 npm install
 ```
 
-On first run a QR code appears in the terminal. Scan it with WhatsApp on your phone:  
-**Settings → Linked Devices → Link a Device**
+On first run a QR code appears in the terminal. Scan it with WhatsApp on your
+phone: **Settings → Linked Devices → Link a Device**.
 
-The session is saved to `.wwebjs_auth/` — subsequent runs reconnect automatically without re-scanning.
+Sessions are stored per account under `.wwebjs_auth/accounts/<name>/`; the
+active one is tracked in `.wwebjs_auth/current`. Connection attempts time out
+after 5 minutes instead of hanging forever, and while connected an exclusive
+lock prevents two processes from corrupting the same session.
 
 ---
 
@@ -29,111 +33,171 @@ The session is saved to `.wwebjs_auth/` — subsequent runs reconnect automatica
 ### Interactive menu (recommended)
 
 ```bash
-./scrape.sh
-# or
-node menu.js
+./scrape.sh        # or: node menu.js
 ```
 
-Opens straight into the live scrape flow (banner + step-by-step status lines
-while the browser launches and the session connects):
+Flow: pick/add/switch/disconnect an account → choose group or personal chat →
+(optionally **Search by name** — handy beyond a couple dozen chats) → pick the
+chat → timeframe → media scope → confirm.
 
-1. **Group or personal chat** — pick which kind of chat to browse
-2. **Chat selection** — lists matching chats
-3. **Timeframe** — today, yesterday, a specific date, a date range, or all time
-4. **Output folder** — name for the export folder (auto-suggested from the date)
-5. **Confirmation** — shows a summary before starting
-
-Navigation: press `q` to go back one step (on lists it works as a hotkey; on
-date/folder inputs type `q` and press Enter), and the export summary's
-`q = no` skips the scrape. The app never exits on its own — after a scrape it
-pauses, then returns you to the same chat list for another round. The only way
-out is `⛔  Exit` in the main menu (or Ctrl+C, which aborts cleanly).
-
-The client stays connected so you can scrape multiple chats or dates without re-authenticating.
+- **Media scope**: everything / transcript-only / pick specific types
+  (images, video, audio, ptt, documents, stickers).
+- **Preview message count** before committing to a big export.
+- `q` goes back on lists; on text prompts type `q` + Enter.
+- Disconnecting an account requires typing its name — no accidental deletes.
+- Download location is configurable from ⚙ Settings (absolute path,
+  validated writable).
 
 ### CLI
 
 ```bash
-node index.js                                    # list your groups + personal chats
-node index.js "Name"                             # full export: media + conversation.txt
-node index.js "Name" "2026-06-13"                # limited to a specific date
-node index.js "Name" "2026-06-13" "FolderName"   # date + custom output folder
+node index.js                                      # list chats (current account)
+node index.js --list-accounts                      # saved accounts
+node index.js --account work "Team"                # export using another account
+node index.js "Name"                               # all time
+node index.js "Name" today | yesterday             # quick day filters
+node index.js "Name" 2026-06-13                    # single date
+node index.js "Name" 2026-06-01 2026-06-30         # inclusive range
+node index.js "Name" all "Backup2026"              # custom folder label
+node index.js "Name" all --text-only               # transcript without media
+node index.js "Name" all --media-types image,video # only these attachment types
+node index.js --all-chats today --text-only        # batch: every chat, transcript
+node index.js --include-broadcast "Name"           # include status/broadcast too
+TZ=America/New_York node index.js "Name" 2026-06-13   # timezone via env
+node index.js --timezone Europe/Berlin "Name"      # …or via flag
+node index.js --output-dir /mnt/d/Downloads        # set download root (persists)
+node index.js --show-output-dir                    # print current root
+node index.js --disconnect old-account             # delete a session
+node -v && node index.js --help
 ```
 
-Name matching is case-insensitive and partial, and matches groups or personal chats — `"bubu"` matches `"Parinti - Buburuze"`.
+Batch mode (`--all-chats`) prints a per-chat summary; one failing chat never
+stops the run. Interrupted exports RESUME: re-run the same command into the
+same folder and the transcript continues where it stopped.
+
+Name matching is case-insensitive; exact match wins, otherwise a unique
+partial match is used — ambiguous partials list the candidates and (in a TTY)
+prompt you to pick one. Known chat names are cached per account, so a typo
+is rejected instantly without launching Chromium. Fast paths (`--help`,
+`--version`, `--list-accounts`, `--disconnect`, `--show-output-dir`) also
+never launch Chromium.
+
+Unknown options are rejected with a hint instead of being silently treated as
+a chat name.
 
 ---
 
 ## Importing a native WhatsApp export (full history, no sync limits)
 
-`index.js`/`menu.js` are capped by whatever WhatsApp Web has synced locally to
-this linked device, and media is only downloadable while it still lives on
-WhatsApp's CDN (a retention window of weeks, not years). For complete history —
-including media WhatsApp's servers have long since expired — export the chat
-from your phone instead:
-
-1. Open the chat on your phone → ⋮ (or contact/group name) → **Export chat** → **Include media**
-2. Transfer the resulting `.zip` to this machine and unzip it
-3. Run:
+Live scraping only reaches what the phone has synced to this linked device,
+and CDN media expires after weeks. For complete history export the chat from
+your phone (**Export chat → Include media**), unzip, then:
 
 ```bash
-node import-export.js "/path/to/WhatsApp Chat with X.txt" [OutputFolder] [--date-format=DMY|MDY]
+node import-export.js "/path/to/WhatsApp Chat with X.txt" [Folder] [options]
+
+Options:
+  --date-format=DMY|MDY|auto   auto (default) sniffs order from the dates
+  --media-types <list>         comma list: image,video,audio,ptt,document,sticker
+  --media-dir <path>           where media files live (default: beside .txt)
+  --output-dir <path>          download-root override
+  --text-only                  transcript without copying media
+  --ignore-missing             hide per-file missing-media logs
+  --dry-run                    report counts, write nothing
 ```
 
-This reads the phone's own export bundle (media files are expected alongside
-the `.txt`, as WhatsApp lays them out), parses the Android/iOS transcript
-format, and reorganizes it into the same output layout as the other entry
-points. `--date-format` defaults to `DMY` (most locales); pass `MDY` if the
-export came from a US-locale phone.
+Handles UTF-8 BOM, Android *and* iOS line styles (dash optional), multi-line
+messages, and several attachments inside one message. Unknown file types land
+in an `other/` bucket rather than masquerading as documents.
+
+Notes: on Android-style exports a sender name containing `:` may truncate at
+the first colon (the plain-text format itself is ambiguous there; iOS exports
+parse fine). Attachment filenames from the export file can never escape the
+media folder (`..` / absolute paths are refused).
 
 ---
 
 ## Output
 
 ```
-<OutputFolder>/
-  conversation.txt  ← full transcript: [timestamp] Sender: body / [attachment path]
-  images/           ← JPEG/PNG named <ISO-timestamp>_<index>.jpg
-  videos/           ← MP4/MOV named <ISO-timestamp>_<index>.mp4
-  audio/            ← voice notes + audio files
-  documents/        ← PDFs and other document attachments
-  stickers/         ← stickers
+<download-root>/<ChatName>/<date>_<session>/
+  conversation.txt  ← "[timestamp] Sender: body" or "[…] Sender: [subdir/file] - caption"
+  images/ videos/ audio/ documents/ stickers/ other/
 ```
 
-`conversation.txt` includes every message in range — text and media — in
-chronological order, with sender name, timestamp, and an inline reference to
-the saved attachment (if any). Files are named by message timestamp so order
-is preserved. Already-downloaded files are skipped on re-run — downloads are
-safe to resume.
+Media filenames carry a local-time stamp matching the transcript lines.
+Newlines inside message bodies are escaped as literal `\n` so the transcript
+stays one-line-per-message and machine-parseable. Live exports APPEND on
+resume (see below); `import-export.js` rewrites its transcript wholesale on
+each run.
 
-Output root defaults to the project directory. Override with `OUTPUT_DIR`:
-
-```bash
-OUTPUT_DIR=/mnt/d/Downloads node menu.js
-```
+Download root precedence: `OUTPUT_DIR` env var → saved config (menu Settings /
+`--output-dir`) → project directory.
 
 ---
 
-## How history loading works
+## Development
 
-WhatsApp Web lazy-loads message history and does not expose the full message
-store. The scraper calls `fetchMessages()` with an ever-increasing limit,
-which forces WhatsApp Web to load earlier batches, until the oldest loaded
-message reaches the target date, retrying through transient stalls before
-giving up. This is the only reliable method — `window.Store` is not
-accessible from whatsapp-web.js.
+```bash
+npm test        # unit tests for pure helpers (node:test, no browser needed)
+```
 
-This still only reaches whatever history the phone has synced to this linked
-device — it is not a substitute for a native chat export if you need the
-complete history (see above).
+Shared logic lives in `lib/core.js` (config/accounts/sanitize/fs helpers,
+account locking) and `lib/scrape.js` (connect, chat list, history loading,
+export pipeline); `menu.js`/`index.js` are thin entry points over them.
+
+---
+
+## Troubleshooting / FAQ
+
+**QR scanned but nothing happens / "Timed out waiting for WhatsApp Web"**
+The 5-minute window elapsed. Re-run and scan promptly; if it persists,
+disconnect + re-add the account (menu) or `node index.js --disconnect <name>`.
+
+**"Account X is in use by another process"**
+A previous run still holds the `.lock` (or a live Chromium has the session).
+Close it; locks are reclaimed automatically as soon as the owning process no
+longer exists (or after 6 h at the latest).
+
+**Session won't restore ("stale or corrupt session data")**
+Delete the account's folder under `.wwebjs_auth/accounts/<name>/` (or use
+Disconnect in the menu) and scan a fresh QR. Corrupt `config.json` is backed
+up automatically as `.wwebjs_auth/config.json.corrupt-*`.
+
+**Media downloads fail with `r: r` or expired-attachment errors**
+WhatsApp CDN links expire after weeks — old media can only be recovered via
+a native phone export (see import-export above). The July 2026 id-rename
+(`_serialized` → `$1`) is already handled transparently.
+
+**Export interrupted halfway**
+Just re-run the same command into the same output folder: progress is flushed
+to a `.export-meta.json` sidecar during the run, so the transcript continues
+where it stopped and already-downloaded media is reused.
+
+**Dates look wrong by hours**
+Everything uses your system timezone. Override per run with
+`--timezone <IANA zone>` or export `TZ=...`.
+
+**Terminal left in a weird state after Ctrl+C**
+`reset` restores it; the menu also cleans up raw-mode on normal exits.
+
+**Known limitation:** very large chats (~50k+ messages) and huge videos can
+exhaust memory — whatsapp-web.js loads messages/media into RAM. Use native
+exports for those chats.
 
 ---
 
 ## Notes
 
-- `.wwebjs_auth/` stores your session token — it is gitignored, never commit it
-- Timestamps use the local system timezone
-- WhatsApp caps history loading at ~50 000 messages per fetch cycle
-- Media on WhatsApp's CDN expires after a retention window (weeks, not years) — expired attachments will fail to download via live scraping; use a native export to recover them
-- Running on WSL requires the `--no-sandbox` Puppeteer flag (already set)
-- A WhatsApp Web frontend update (July 2026) renamed the internal message id field `_serialized` → `$1`, which broke media downloads in whatsapp-web.js 1.34.x with an opaque `r: r` error. The scraper backfills `_serialized` from `$1` on every loaded message, so downloads keep working against both old and new builds.
+- `.wwebjs_auth/` stores live session tokens — gitignored, never commit;
+  permissions are tightened to owner-only on connect.
+- Timestamps use the local system timezone throughout.
+- History loading caps at ~50 000 messages per cycle and retries stalls with
+  exponential backoff before giving up.
+- Expired CDN attachments fail to download — use a native export to recover.
+- WSL needs the `--no-sandbox` Puppeteer flag (already set).
+- Windows works but with caveats: the stale-Chromium cleaner and the
+  owner-only session permissions are Linux/macOS features (no-ops there).
+- The July 2026 WhatsApp Web id rename (`_serialized` → `$1`) broke media
+  downloads in whatsapp-web.js 1.34.x; the scraper backfills `_serialized`
+  from `$1`, so both old and new builds keep working.

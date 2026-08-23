@@ -5,7 +5,11 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "menu": "node menu.js"
+    "menu": "node menu.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "inquirer": "^8.2.7",
