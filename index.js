@@ -214,7 +214,9 @@ async function main() {
     client = await scrape.connectClient(accountName);
     console.log('[OK] WhatsApp ready.');
 
+    console.log('[INFO] Loading chat list…');
     const chats = await scrape.getChatsCompat(client);
+    console.log(`[OK] ${chats.length} chats loaded.`);
     scrape.cacheChats(accountName, chats);
 
     const keepId = id => id !== 'status@broadcast';
@@ -283,8 +285,9 @@ async function main() {
       if (!core.ensureDir(outDir)) { failures.push([displayName, 'cannot create output dir']); continue; }
 
       try {
+        console.log('[INFO] Loading history…');
         const loaded = await scrape.loadHistory(chat, startTs);
-        const r = await scrape.exportChat(chat, { startTs, endTs, outDir, loadedCount: loaded, ...scopeOpts });
+        const r = await scrape.exportChat(chat, { startTs, endTs, outDir, loadedMessages: loaded, ...scopeOpts });
         results.push([displayName, r]);
         if (r.resumed === 'complete') console.log(`[DONE] Already exported — skipped.`);
         else console.log(`[DONE] ${r.saved} file(s)` +
