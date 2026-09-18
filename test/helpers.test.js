@@ -5,6 +5,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const core = require('../lib/core');
+const scrape = require('../lib/scrape');
 const ie = require('../import-export');
 
 // ── sanitizeName ────────────────────────────────────────────────────────
@@ -212,4 +213,92 @@ test('importExport: filter excludes missing files from the missing count (dry-ru
   const dryAll = await ie.importExport(path.join(tmp, 'chat.txt'), path.join(tmp, 'o'),
     { mediaDir: tmp, dryRun: true });
   assert.strictEqual(dryAll.missing, 1, 'unfiltered run does report the missing image');
+
+// ── Chromium self-healing (no browser launched) ────────────────────────
+test('resolvePuppeteerCli: finds the real CLI entry for the installed puppeteer', () => {
+  const cli = scrape.resolvePuppeteerCli();
+  assert.ok(cli, 'puppeteer CLI must be resolvable');
+  assert.ok(fs.existsSync(cli), `resolved CLI must exist: ${cli}`);
+});
+
+test('chromiumWorks: a plain text file is not a browser', () => {
+  const os = require('node:os');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wms-chr-'));
+  try {
+    fs.writeFileSync(path.join(tmp, 'fake-chrome'), 'not a binary');
+    assert.strictEqual(scrape.chromiumWorks(path.join(tmp, 'fake-chrome')), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// Point the cache-dir env at a scratch dir and restore both env + files
+// afterwards, so cache-detection tests never touch the real ~/.cache.
+function withIsolatedCache(t, tmp, fn) {
+  const prev = {
+    HOME: process.env.HOME,
+    PUPPETEER_CACHE_DIR: process.env.PUPPETEER_CACHE_DIR,
+    PUPPETEER_CACHEDIR: process.env.PUPPETEER_CACHEDIR,
+  };
+  process.env.HOME = tmp;
+  process.env.PUPPETEER_CACHE_DIR = path.join(tmp, 'cache');
+  delete process.env.PUPPETEER_CACHEDIR;
+  t.after(() => {
+    for (const k of Object.keys(prev)) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+  return fn();
+}
+
+test('findChromium: honours cache-dir env and yields nothing when empty', t => {
+  const os = require('node:os');
+  withIsolatedCache(t, fs.mkdtempSync(path.join(os.tmpdir(), 'wms-cache-')), () => {
+    assert.strictEqual(scrape.findChromium(), null);
+  });
+});
+
+test('findChromium: prefers the genuinely newest build, not lexicographic order', t => {
+  const os = require('node:os');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wms-cache-'));
+  const cache = path.join(tmp, 'cache');
+  for (const build of ['linux-92.0.4515.159', 'linux-115.0.5790.187']) {
+    const dir = path.join(cache, 'chrome', build, 'chrome-linux64');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'chrome'), 'placeholder');
+  }
+  withIsolatedCache(t, tmp, () => {
+    const exe = scrape.findChromium();
+    assert.ok(exe, 'a cached build must be found');
+    assert.ok(exe.endsWith(path.join('linux-115.0.5790.187', 'chrome-linux64', 'chrome')),
+      `expected 115 (newer numerically) to win over 92, got: ${exe}`);
+  });
+});
+
+// ── downloadMediaWithRetry (transient CDN failures) ─────────────────────
+test('downloadMediaWithRetry: succeeds after transient failures', async () => {
+  let calls = 0;
+  const msg = {
+    downloadMedia: async () => {
+      calls++;
+      if (calls < 3) throw new Error('net::ERR_CONNECTION_RESET');
+      return { data: Buffer.from('aGk=', 'base64'), filename: 'x.jpg' };
+    },
+  };
+  const m = await scrape.downloadMediaWithRetry(msg, { delayMs: 1 });
+  assert.strictEqual(calls, 3, 'retried after each transient failure');
+  assert.strictEqual(m.filename, 'x.jpg');
+});
+
+test('downloadMediaWithRetry: empty result surfaces as a failure', async () => {
+  const msg = { downloadMedia: async () => null };
+  await assert.rejects(() => scrape.downloadMediaWithRetry(msg, { delayMs: 1 }), /no data returned/);
+});
+
+test('downloadMediaWithRetry: gives up loudly after all attempts', async () => {
+  const msg = { downloadMedia: async () => { throw new Error('media gone from CDN'); } };
+  await assert.rejects(() => scrape.downloadMediaWithRetry(msg, { delayMs: 1 }), /media gone from CDN/);
+});
 });

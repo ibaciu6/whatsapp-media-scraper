@@ -305,6 +305,10 @@ module.exports = { importExport, classify, parseDate, detectDateFormat, LINE_RE 
 
 // ── CLI ─────────────────────────────────────────────────────────────────
 if (require.main === module) {
+  process.on('unhandledRejection', e => {
+    console.error(`[ERR] Unexpected failure: ${e && e.message ? e.message : e}`);
+    process.exit(1);
+  });
   (async () => {
   const argv = process.argv.slice(2);
   const opts = { dateFormat: 'auto', mediaDir: null, outputDir: null, folder: null,
