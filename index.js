@@ -126,9 +126,12 @@ async function main() {
   if (opts.outputDir) {
     const err = core.validateOutputDir(opts.outputDir);
     if (err) fail(err);
-    core.setBaseOutputDir(path.resolve(opts.outputDir.trim()));
-    console.log(`[OK] Download location set to: ${path.resolve(opts.outputDir.trim())}`);
-    if (!opts.name && !opts.allChats) return;     // setting-only invocation
+    const saved = core.setBaseOutputDir(path.resolve(opts.outputDir.trim()));
+    console.log(saved
+      ? `[OK] Download location set to: ${path.resolve(opts.outputDir.trim())}`
+      : `[ERR] Download location NOT saved (check permissions / disk space): ${path.resolve(opts.outputDir.trim())}`);
+    if (saved && !opts.name && !opts.allChats) return;     // setting-only invocation
+    if (!saved && !opts.name && !opts.allChats) process.exitCode = 1;
   }
 
   if (opts.listAccounts) {
@@ -187,10 +190,11 @@ async function main() {
       const hit = cache.chats.some(c =>
         ((c.name || '') + ' ' + c.id.split('@')[0]).toLowerCase().includes(needle));
       if (!hit) {
-        console.error(`[ERR] No chat matching "${opts.name}" in the cached list ` +
-          `for account "${accountName}" (${cache.chats.length} chats, saved ${core.relTime(cache.savedAt)}).`);
-        console.error('      If the chat is brand-new, run once without this name to refresh the cache.');
-        process.exit(1);
+        // The cache is a hint, not a verdict: brand-new chats miss it. Warn and
+        // fall through to the live lookup instead of failing before connecting.
+        console.error(`[WARN] "${opts.name}" not in the cached chat list ` +
+          `(${cache.chats.length} chats, saved ${core.relTime(cache.savedAt)}).`);
+        console.error('      Proceeding with a live search — the cache may be stale.');
       }
     }
   }
@@ -288,6 +292,13 @@ async function main() {
         console.log('[INFO] Loading history…');
         const loaded = await scrape.loadHistory(chat, startTs);
         const r = await scrape.exportChat(chat, { startTs, endTs, outDir, loadedMessages: loaded, ...scopeOpts });
+        if (r.error) {
+          // Refusal results (symlink guard) are failures, not successes: they
+          // must surface in this run's failure accounting (and exit code).
+          throw new Error(r.error === 'symlink'
+            ? 'output folder contains a symlink where export files belong — refusing to write'
+            : String(r.error));
+        }
         results.push([displayName, r]);
         if (r.resumed === 'complete') console.log(`[DONE] Already exported — skipped.`);
         else console.log(`[DONE] ${r.saved} file(s)` +
@@ -308,7 +319,13 @@ async function main() {
       for (const [name, why] of failures)
         console.log(`  ✗ ${name}: ${why}`);
       console.log(`=========================`);
-      if (failures.length) process.exitCode = 1;
+    }
+    // Single-chat failures must not exit 0 either — a "successful" exit helps
+    // nobody. Each failure already logged its reason above.
+    if (failures.length) {
+      console.error(`\n[WARN] ${failures.length} chat(s) failed. ` +
+        `Re-run the same command to resume them (partial exports continue).`);
+      process.exitCode = 1;
     }
   } finally {
     if (client) { try { await client.destroy(); } catch {} }
@@ -317,6 +334,13 @@ async function main() {
 }
 
 if (require.main === module) {
+  // Last-resort safety net: an unhandled rejection (stray timer, stream error)
+  // must not become a stack-trace crash. main() already catches its own flow —
+  // this only catches what escaped it.
+  process.on('unhandledRejection', e => {
+    console.error('\n[ERR] Unexpected failure: ' + (e && e.message ? e.message : e));
+    process.exit(1);
+  });
   main().catch(e => {
     console.error('[ERR] ' + (e && e.message ? e.message : e));
     process.exit(1);
